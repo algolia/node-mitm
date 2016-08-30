@@ -4,12 +4,13 @@ var Net = require("net")
 var Tls = require("tls")
 var Http = require("http")
 var Https = require("https")
+var Semver = require("semver")
 var IncomingMessage = Http.IncomingMessage
 var ServerResponse = Http.ServerResponse
 var ClientRequest = Http.ClientRequest
 var EventEmitter = require("events").EventEmitter
 var Mitm = require("..")
-var NODE_0_10 = !!process.version.match(/^v0\.10\./)
+var NODE_0_10 = Semver.satisfies(process.version, ">= 0.10 < 0.11")
 
 describe("Mitm", function() {
   beforeEach(function() { Mitm.passthrough = false })
@@ -47,7 +48,7 @@ describe("Mitm", function() {
         onConnect.firstCall.args[1].must.equal(opts)
       })
 
-      it("must emit connect with options object given host and port",
+      it("must emit connect on Mitm with options object given host and port",
         function() {
         var onConnect = Sinon.spy()
         this.mitm.on("connect", onConnect)
@@ -70,26 +71,17 @@ describe("Mitm", function() {
         onConnection.firstCall.args[1].must.equal(opts)
       })
 
-      it("must emit connect on socket in next tick", function(done) {
+      it("must emit connect on socket in next ticks", function(done) {
         var socket = module.connect({host: "foo"})
-        var onConnect = Sinon.spy()
-        socket.on("connect", onConnect)
-        process.nextTick(function() { onConnect.callCount.must.equal(1) })
-        process.nextTick(done)
+        socket.on("connect", done.bind(null, null))
       })
 
       it("must call back on connect given callback", function(done) {
-        var onConnect = Sinon.spy()
-        module.connect({host: "foo"}, onConnect)
-        process.nextTick(function() { onConnect.callCount.must.equal(1) })
-        process.nextTick(done)
+        module.connect({host: "foo"}, done.bind(null, null))
       })
 
       it("must call back on connect given port and callback", function(done) {
-        var onConnect = Sinon.spy()
-        module.connect(80, onConnect)
-        process.nextTick(function() { onConnect.callCount.must.equal(1) })
-        process.nextTick(done)
+        module.connect(80, done.bind(null, null))
       })
 
       // This was a bug found on Apr 26, 2014 where the host argument was taken
@@ -97,21 +89,23 @@ describe("Mitm", function() {
       // object.
       it("must call back on connect given port, host and callback",
         function(done) {
-        var onConnect = Sinon.spy()
-        module.connect(80, "localhost", onConnect)
-        process.nextTick(function() { onConnect.callCount.must.equal(1) })
-        process.nextTick(done)
+        module.connect(80, "localhost", done.bind(null, null))
       })
 
-      it("must intercept 127.0.0.1", function() {
+      it("must intercept 127.0.0.1", function(done) {
         var server; this.mitm.on("connection", function(s) { server = s })
         var client = module.connect({host: "127.0.0.1"})
         server.write("Hello")
+
         client.setEncoding("utf8")
-        client.read().must.equal("Hello")
+        client.on("data", function(data) { data.must.equal("Hello") })
+        client.on("data", done.bind(null, null))
       })
 
       describe("when bypassed", function() {
+        beforeEach(function() { this.sinon = Sinon.sandbox.create() })
+        afterEach(function() { this.sinon.restore() })
+
         it("must not intercept", function(done) {
           this.mitm.on("connect", function(client) { client.bypass() })
 
@@ -124,13 +118,19 @@ describe("Mitm", function() {
 
         it("must call original module.connect", function() {
           this.mitm.disable()
-          var connect = this.sinon.spy(module, "connect")
-          this.mitm = Mitm()
-          this.mitm.on("connect", function(client) { client.bypass() })
 
-          module.connect({host: "127.0.0.1", port: 9}).on("error", noop)
-          connect.callCount.must.equal(1)
-          connect.firstCall.args[0].must.eql({host: "127.0.0.1", port: 9})
+          var connect = this.sinon.spy(module, "connect")
+          var mitm = Mitm()
+          mitm.on("connect", function(client) { client.bypass() })
+
+          try {
+            module.connect({host: "127.0.0.1", port: 9}).on("error", noop)
+            connect.callCount.must.equal(1)
+            connect.firstCall.args[0].must.eql({host: "127.0.0.1", port: 9})
+          }
+          // Working around Mocha's context bug(s) and poor design decision
+          // with a manual `finally`.
+          finally { mitm.disable() }
         })
 
         it("must not call back twice on connect given callback",
@@ -159,16 +159,14 @@ describe("Mitm", function() {
 
   describe("Net.connect", function() {
     beforeEach(function() { this.mitm = Mitm() })
-    beforeEach(function() { this.sinon = Sinon.sandbox.create() })
-    afterEach(function() { this.sinon.restore() })
     afterEach(function() { this.mitm.disable() })
 
     mustConnect(Net)
 
     if (!NODE_0_10)
     it("must not return an instance of Tls.TLSSocket", function() {
-      var socket = Net.connect({host: "foo", port: 80})
-      socket.must.not.be.an.instanceof(Tls.TLSSocket)
+      var client = Net.connect({host: "foo", port: 80})
+      client.must.not.be.an.instanceof(Tls.TLSSocket)
     })
 
     it("must not set the encrypted property", function() {
@@ -179,74 +177,136 @@ describe("Mitm", function() {
       Net.connect({host: "foo"}).must.not.have.property("authorized")
     })
 
+    it("must not emit secureConnect on client", function(done) {
+      var client = Net.connect({host: "foo"})
+      // Let Mocha raise an error when done called twice.
+      client.on("secureConnect", done.bind(null, null))
+      done()
+    })
+
+    it("must not emit secureConnect on server", function(done) {
+      var server; this.mitm.on("connection", function(s) { server = s })
+      Net.connect({host: "foo"})
+      // Let Mocha raise an error when done called twice.
+      server.on("secureConnect", done.bind(null, null))
+      done()
+    })
+
     describe("Socket", function() {
       describe(".prototype.write", function() {
-        it("must write to client side from server side", function() {
+        it("must write to client from server", function(done) {
           var server; this.mitm.on("connection", function(s) { server = s })
           var client = Net.connect({host: "foo"})
           server.write("Hello")
+
           client.setEncoding("utf8")
-          client.read().must.equal("Hello")
+          client.on("data", function(data) { data.must.equal("Hello") })
+          client.on("data", done.bind(null, null))
         })
 
-        it("must write to server side from client side", function() {
+        it("must write to client from server in the next tick", function(done) {
+          var server; this.mitm.on("connection", function(s) { server = s })
+          var client = Net.connect({host: "foo"})
+
+          var ticked = false
+          client.once("data", function() { ticked.must.be.true(); done() })
+          server.write("Hello")
+          ticked = true
+        })
+
+        it("must write to server from client", function(done) {
           var server; this.mitm.on("connection", function(s) { server = s })
           var client = Net.connect({host: "foo"})
           client.write("Hello")
+
           server.setEncoding("utf8")
-          server.read().must.equal("Hello")
+          process.nextTick(function() { server.read().must.equal("Hello") })
+          process.nextTick(done)
+        })
+
+        it("must write to server from client in the next tick", function(done) {
+          var server; this.mitm.on("connection", function(s) { server = s })
+          var client = Net.connect({host: "foo"})
+
+          var ticked = false
+          server.once("data", function() { ticked.must.be.true(); done() })
+          client.write("Hello")
+          ticked = true
         })
 
         // Writing binary strings was introduced in Node v0.11.14.
         // The test still passes for Node v0.10 and newer v0.11s, so let it be.
-        it("must write to server side from client side given binary",
-          function() {
+        it("must write to server from client given binary", function(done) {
           var server; this.mitm.on("connection", function(s) { server = s })
           var client = Net.connect({host: "foo"})
           client.write("Hello", "binary")
+
           server.setEncoding("binary")
-          server.read().must.equal("Hello")
+          process.nextTick(function() { server.read().must.equal("Hello") })
+          process.nextTick(done)
         })
 
-        it("must write to server side from client side given a buffer",
-          function() {
+        // Writing latin1 strings was introduced in v6.4.
+        // https://github.com/nodejs/node/commit/28071a130e2137bd14d0762a25f0ad83b7a28259
+        if (Semver.satisfies(process.version, ">= 6.4"))
+        it("must write to server from client given latin1", function(done) {
+          var server; this.mitm.on("connection", function(s) { server = s })
+          var client = Net.connect({host: "foo"})
+          client.write("Hello", "latin1")
+
+          server.setEncoding("latin1")
+          process.nextTick(function() { server.read().must.equal("Hello") })
+          process.nextTick(done)
+        })
+
+        it("must write to server from client given a buffer", function(done) {
           var server; this.mitm.on("connection", function(s) { server = s })
           var client = Net.connect({host: "foo"})
           client.write(new Buffer("Hello"))
+
           server.setEncoding("utf8")
-          server.read().must.equal("Hello")
+          process.nextTick(function() { server.read().must.equal("Hello") })
+          process.nextTick(done)
         })
 
-        it("must write to server side from client side given a UTF-8 string",
-          function() {
+        it("must write to server from client given a UTF-8 string",
+          function(done) {
           var server; this.mitm.on("connection", function(s) { server = s })
           var client = Net.connect({host: "foo"})
           client.write("Hello", "utf8")
+
           server.setEncoding("utf8")
-          server.read().must.equal("Hello")
+          process.nextTick(function() { server.read().must.equal("Hello") })
+          process.nextTick(done)
         })
 
-        it("must write to server side from client side given a ASCII string",
-          function() {
+        it("must write to server from client given a ASCII string",
+          function(done) {
           var server; this.mitm.on("connection", function(s) { server = s })
           var client = Net.connect({host: "foo"})
           client.write("Hello", "ascii")
+
           server.setEncoding("utf8")
-          server.read().must.equal("Hello")
+          process.nextTick(function() { server.read().must.equal("Hello") })
+          process.nextTick(done)
         })
 
-        it("must write to server side from client side given a UCS-2 string",
-          function() {
+        it("must write to server from client given a UCS-2 string",
+          function(done) {
           var server; this.mitm.on("connection", function(s) { server = s })
           var client = Net.connect({host: "foo"})
           client.write("Hello", "ucs2")
-          server.setEncoding("ucs2")
-          server.read().must.equal("H\u0000e\u0000l\u0000l\u0000o\u0000")
+
+          process.nextTick(function() {
+            server.setEncoding("ucs2")
+            server.read().must.equal("H\u0000e\u0000l\u0000l\u0000o\u0000")
+            done()
+          })
         })
       })
 
       describe(".prototype.end", function() {
-        it("must emit end when closed on server side", function(done) {
+        it("must emit end when closed on server", function(done) {
           var server; this.mitm.on("connection", function(s) { server = s })
           var client = Net.connect({host: "foo"})
           server.end()
@@ -267,8 +327,6 @@ describe("Mitm", function() {
 
   describe("Tls.connect", function() {
     beforeEach(function() { this.mitm = Mitm() })
-    beforeEach(function() { this.sinon = Sinon.sandbox.create() })
-    afterEach(function() { this.sinon.restore() })
     afterEach(function() { this.mitm.disable() })
 
     mustConnect(Tls)
@@ -289,6 +347,38 @@ describe("Mitm", function() {
       Tls.connect(80, "10.0.0.1").must.be.an.instanceof(Tls.TLSSocket)
     })
 
+    it("must emit secureConnect in next ticks", function(done) {
+      var socket = Tls.connect({host: "foo"})
+      socket.on("secureConnect", done.bind(null, null))
+    })
+
+    it("must emit secureConnect after connect in next ticks", function(done) {
+      var socket = Tls.connect({host: "foo"})
+
+      socket.on("connect", function() {
+        socket.on("secureConnect", done.bind(null, null))
+      })
+    })
+
+    it("must not emit secureConnect on server", function(done) {
+      var server; this.mitm.on("connection", function(s) { server = s })
+      Tls.connect({host: "foo"})
+      // Let Mocha raise an error when done called twice.
+      server.on("secureConnect", done.bind(null, null))
+      done()
+    })
+
+    it("must call back on secureConnect", function(done) {
+      var connected = false
+
+      var client = Tls.connect({host: "foo"}, function() {
+        connected.must.be.true()
+        done()
+      })
+
+      client.on("connect", function() { connected = true })
+    })
+
     it("must set encrypted true", function() {
       Tls.connect({host: "foo"}).encrypted.must.be.true()
     })
@@ -299,7 +389,8 @@ describe("Mitm", function() {
   })
 
   function mustRequest(request) {
-    describe("as a requester", function() {
+    describe("as request", function() {
+      beforeEach(function() { this.mitm.disable() })
       beforeEach(function() { this.mitm = Mitm() })
       afterEach(function() { this.mitm.disable() })
 
@@ -351,11 +442,25 @@ describe("Mitm", function() {
         })
       })
 
-      it("must emit request on Mitm after multiple requests", function(done){
+      it("must emit request on Mitm after multiple requests", function(done) {
         request({host: "foo"}).end()
         request({host: "foo"}).end()
         request({host: "foo"}).end()
         this.mitm.on("request", _.after(3, done.bind(null, null)))
+      })
+
+      it("must emit socket on request in next ticks", function(done) {
+        var client = request({host: "foo"})
+        client.on("socket", done.bind(null, null))
+      })
+
+      // https://github.com/moll/node-mitm/pull/25
+      it("must emit connect after socket event", function(done) {
+        var client = request({host: "foo"})
+
+        client.on("socket", function(socket) {
+          socket.on("connect", done.bind(null, null))
+        })
       })
 
       describe("when bypassed", function() {
@@ -386,7 +491,19 @@ describe("Mitm", function() {
   })
 
   describe("via Https.request", function() {
+    beforeEach(function() { this.mitm = Mitm() })
+    afterEach(function() { this.mitm.disable() })
+
     mustRequest(Https.request)
+
+    // https://github.com/moll/node-mitm/pull/25
+    it("must emit secureConnect after socket event", function(done) {
+      var client = Https.request({host: "foo"})
+
+      client.on("socket", function(socket) {
+        socket.on("secureConnect", done.bind(null, null))
+      })
+    })
   })
 
   describe("via Http.Agent", function() {
